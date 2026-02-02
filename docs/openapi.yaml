@@ -367,7 +367,7 @@ components:
         filename: { type: string }
         base64:
           type: string
-          description: Base64-encoded invoice file (no data: prefix).
+          description: Base64-encoded invoice file (no data prefix).
       required: []
 
     ShipmentCreateRequest:
