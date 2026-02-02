@@ -352,11 +352,11 @@ components:
       properties:
         shipperType:
           type: string
-          description: Example values: "EORI", "VAT", "OTHER" (depends on your setup).
+          description: Example values "EORI", "VAT", "OTHER" (depends on your setup).
         shipperNumber: { type: string }
         recipientType:
           type: string
-          description: Example values: "EIN", "EORI", "VAT", "OTHER" (depends on destination).
+          description: Example values "EIN", "EORI", "VAT", "OTHER" (depends on destination).
         recipientNumber: { type: string }
       required: [shipperType, shipperNumber, recipientType, recipientNumber]
 
