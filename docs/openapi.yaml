@@ -1,13 +1,15 @@
 openapi: 3.1.0
 info:
-  title: TFF Shipping API
+  title: Inset Shipping API
   version: 1.0.0
   description: >
     Use this API to:
       1) request shipping options (rates)
       2) create a shipment (labels/documents) using a previously selected option
 
-    The API returns consistent error messages with a small set of error codes.
+    Notes:
+      - If input data is incomplete/invalid, the API returns HTTP 422 with field-level details.
+      - For some destinations (US/CA/AU), a region/state is required.
 
 servers:
   - url: https://api.inset.example
@@ -20,7 +22,7 @@ tags:
   - name: Shipments
   - name: Documents
 
-security: []   # per-endpoint
+security: [] # per-endpoint
 
 components:
   securitySchemes:
@@ -28,42 +30,26 @@ components:
       type: apiKey
       in: header
       name: X-API-Key
-      description: Key used by frontend/checkout to request rates.
+      description: Key used by frontend (public flow) to request rates.
 
     BackendKeyAuth:
       type: apiKey
       in: header
       name: X-Backend-Key
-      description: Key used by server/admin/ERP to create shipments and fetch documents.
+      description: Key used by backend/admin systems to create shipments and fetch documents.
 
   parameters:
-    XRequestId:
-      name: X-Request-Id
-      in: header
-      required: false
-      description: Optional request identifier (useful for troubleshooting).
-      schema:
-        type: string
-        minLength: 1
-        maxLength: 128
-
     IdempotencyKey:
       name: Idempotency-Key
       in: header
       required: true
       description: >
-        A unique key for this shipment request. If the same request is sent again with the same key,
-        the API will not create duplicates.
+        Unique key for this shipment request. If the same request is sent again with the same key,
+        the API will not create duplicate shipments.
       schema:
         type: string
         minLength: 8
         maxLength: 200
-
-  headers:
-    XRequestId:
-      description: Request identifier.
-      schema:
-        type: string
 
   schemas:
     # -----------------------------
@@ -73,15 +59,13 @@ components:
       type: string
       enum:
         - VALIDATION_ERROR
-        - INVALID_ADDRESS
         - CUSTOMS_REQUIRED
         - NO_SERVICES_AVAILABLE
-        - TEMPORARY_CARRIER_FAILURE
-        - UPSTREAM_TIMEOUT
-        - AUTH_FAILED
+        - TEMPORARY_UNAVAILABLE
+        - TIMEOUT
+        - UNAUTHORIZED
         - RATE_LIMITED
         - CONFLICT
-        - UPSTREAM_ERROR
         - INTERNAL_ERROR
         - SELECTION_EXPIRED
         - SELECTION_MISMATCH
@@ -98,7 +82,7 @@ components:
           description: Machine-readable reason (required/invalid_format/out_of_range/etc.).
         message:
           type: string
-          description: Optional extra detail.
+          description: Optional extra detail (often includes an example format).
       required: [path, reason]
 
     ErrorResponse:
@@ -112,7 +96,7 @@ components:
             code: { $ref: "#/components/schemas/ErrorCode" }
             message:
               type: string
-              description: Human-readable message safe for UI.
+              description: Human-readable message safe to display to end users.
             retryable:
               type: boolean
               description: Whether retrying later can help.
@@ -126,14 +110,50 @@ components:
       required: [error]
 
     # -----------------------------
-    # Request models
+    # Inputs
     # -----------------------------
-    AddressInput:
+    AddressRatesInput:
       type: object
       additionalProperties: false
       description: >
-        Address fields used to calculate rates and create shipments.
-        Region is especially important for US/CA addresses.
+        Minimum address data needed to calculate rates.
+        Region/state is required for US/CA/AU.
+      properties:
+        country:
+          type: string
+          minLength: 2
+          maxLength: 2
+          description: ISO 3166-1 alpha-2 (e.g. "NL", "DE", "US").
+        postalCode:
+          type: string
+          maxLength: 16
+        city:
+          type: string
+          maxLength: 35
+        street:
+          type: string
+          maxLength: 35
+          description: Street name (without house number).
+        houseNumber:
+          type: string
+          maxLength: 35
+          description: House number/addition. If unknown, you may leave it empty.
+        region:
+          type: string
+          maxLength: 35
+          description: State/Province/Region (required for US/CA/AU).
+        company:
+          type: string
+          maxLength: 35
+          description: Optional.
+      required: [country, postalCode, city, street]
+
+    AddressShipmentInput:
+      type: object
+      additionalProperties: false
+      description: >
+        Address data for shipment creation.
+        Region/state is required for US/CA/AU.
       properties:
         company:
           type: string
@@ -142,52 +162,49 @@ components:
         firstName:
           type: string
           maxLength: 35
-          description: Optional for rates, recommended for shipment creation.
         lastName:
           type: string
           maxLength: 35
-          description: Optional for rates, recommended for shipment creation.
         email:
           type: string
-          description: Optional for rates, recommended for shipment creation.
+          description: Optional (but recommended).
         phoneNumber:
           type: string
           maxLength: 32
-          description: Optional for rates, recommended for shipment creation.
-        street:
-          type: string
-          maxLength: 35
-          description: Street name (without house number).
-        houseNumber:
-          type: string
-          maxLength: 35
-          description: House number / addition. If unknown, you may leave it empty.
-        city:
-          type: string
-          maxLength: 35
-        region:
-          type: string
-          maxLength: 35
-          description: State/Province/Region. For US/CA shipments this should be provided.
-        postalCode:
-          type: string
-          maxLength: 16
         country:
           type: string
           minLength: 2
           maxLength: 2
-          description: ISO 3166-1 alpha-2 (e.g. "NL", "DE", "US").
+        postalCode:
+          type: string
+          maxLength: 16
+        city:
+          type: string
+          maxLength: 35
+        street:
+          type: string
+          maxLength: 35
+        houseNumber:
+          type: string
+          maxLength: 35
+          description: If unknown, you may leave it empty.
+        region:
+          type: string
+          maxLength: 35
+          description: State/Province/Region (required for US/CA/AU).
       required:
+        - firstName
+        - lastName
+        - phoneNumber
         - country
         - postalCode
-        - street
         - city
+        - street
 
     PackageInput:
       type: object
       additionalProperties: false
-      description: >
-        Package dimensions in cm and weight in kg.
+      description: Package dimensions in cm and weight in kg.
       properties:
         type:
           type: string
@@ -207,7 +224,6 @@ components:
         stackable:
           type: boolean
           default: false
-          description: Optional.
       required: [type, length, width, height, weight]
 
     TruckOptions:
@@ -220,18 +236,20 @@ components:
         recipientForklift: { type: boolean, default: false }
         recipientTailLift: { type: boolean, default: false }
 
-    RatesContext:
+    RequestContext:
       type: string
-      enum: [checkout, backend]
-      description: "checkout is optimized for user-facing flows; backend is for system/admin usage."
+      enum: [customer, admin]
+      description: >
+        customer: end-user flow (e.g. webshop checkout)
+        admin: backoffice/admin flow
 
     QuoteRequest:
       type: object
       additionalProperties: false
       properties:
-        context: { $ref: "#/components/schemas/RatesContext" }
-        shipper: { $ref: "#/components/schemas/AddressInput" }
-        recipient: { $ref: "#/components/schemas/AddressInput" }
+        context: { $ref: "#/components/schemas/RequestContext" }
+        shipper: { $ref: "#/components/schemas/AddressRatesInput" }
+        recipient: { $ref: "#/components/schemas/AddressRatesInput" }
         packages:
           type: array
           minItems: 1
@@ -241,7 +259,7 @@ components:
       required: [context, shipper, recipient, packages]
 
     # -----------------------------
-    # Rates response
+    # Rates output
     # -----------------------------
     AccessPoint:
       type: object
@@ -269,12 +287,8 @@ components:
         Shipping option you can show to the user.
         To create a shipment later, store quoteId + rateId + rateToken.
       properties:
-        quoteId:
-          type: string
-          description: Quote identifier.
-        rateId:
-          type: string
-          description: Unique rate id inside the quote.
+        quoteId: { type: string }
+        rateId: { type: string }
         serviceId:
           type: string
           description: Stable service identifier.
@@ -317,6 +331,7 @@ components:
       type: object
       additionalProperties: false
       properties:
+        requestId: { type: string }
         quoteId: { type: string }
         expiresAt:
           type: string
@@ -328,7 +343,7 @@ components:
         warnings:
           type: array
           items: { $ref: "#/components/schemas/QuoteWarning" }
-      required: [quoteId, expiresAt, rates]
+      required: [requestId, quoteId, expiresAt, rates]
 
     # -----------------------------
     # Shipment creation
@@ -348,11 +363,13 @@ components:
     RegistrationInfo:
       type: object
       additionalProperties: false
-      description: Required for export shipments.
+      description: >
+        Registration details used for customs/export shipments.
+        If required but missing, the API returns 422 CUSTOMS_REQUIRED.
       properties:
         shipperType:
           type: string
-          description: Example values "EORI", "VAT", "OTHER" (depends on your setup).
+          description: Example values "EORI", "VAT", "OTHER" (depends on destination).
         shipperNumber: { type: string }
         recipientType:
           type: string
@@ -370,6 +387,51 @@ components:
           description: Base64-encoded invoice file (no data prefix).
       required: []
 
+    SelectedRate:
+      type: object
+      additionalProperties: false
+      description: The rate chosen earlier (store from the quote response).
+      properties:
+        quoteId: { type: string }
+        rateId: { type: string }
+        rateToken: { type: string }
+      required: [quoteId, rateId, rateToken]
+
+    ShippingOptions:
+      type: object
+      additionalProperties: false
+      properties:
+        incoterm: { $ref: "#/components/schemas/Incoterm" }
+        exportReason: { $ref: "#/components/schemas/ExportReason" }
+        originCountry:
+          type: string
+          minLength: 2
+          maxLength: 2
+          description: ISO 3166-1 alpha-2
+        description:
+          type: string
+          maxLength: 35
+          description: Short contents description.
+        totalValue:
+          type: number
+          minimum: 0
+          description: Total shipment value (for customs/export).
+        signatureRequired: { $ref: "#/components/schemas/SignatureRequired" }
+        deliveryInstructions:
+          type: string
+          maxLength: 15
+          description: Optional short instructions.
+        insuranceValue:
+          type: number
+          minimum: 0
+          description: Optional.
+        pickupPointId:
+          type: string
+          description: Optional. Use when an access point was chosen.
+        registration:
+          $ref: "#/components/schemas/RegistrationInfo"
+      required: [incoterm, exportReason, originCountry, description, totalValue, signatureRequired]
+
     ShipmentCreateRequest:
       type: object
       additionalProperties: false
@@ -377,57 +439,15 @@ components:
         reference:
           type: string
           description: Your unique reference for this shipment (e.g. an order number).
-        shipper:
-          $ref: "#/components/schemas/AddressInput"
-        recipient:
-          $ref: "#/components/schemas/AddressInput"
+        shipper: { $ref: "#/components/schemas/AddressShipmentInput" }
+        recipient: { $ref: "#/components/schemas/AddressShipmentInput" }
         packages:
           type: array
           minItems: 1
           items: { $ref: "#/components/schemas/PackageInput" }
-        selectedRate:
-          type: object
-          additionalProperties: false
-          description: The rate chosen earlier (store from the quote response).
-          properties:
-            quoteId: { type: string }
-            rateId: { type: string }
-            rateToken: { type: string }
-          required: [quoteId, rateId, rateToken]
-        shippingOptions:
-          type: object
-          additionalProperties: false
-          properties:
-            incoterm: { $ref: "#/components/schemas/Incoterm" }
-            exportReason: { $ref: "#/components/schemas/ExportReason" }
-            originCountry:
-              type: string
-              minLength: 2
-              maxLength: 2
-              description: ISO 3166-1 alpha-2
-            description:
-              type: string
-              maxLength: 35
-              description: Short contents description.
-            totalValue:
-              type: number
-              minimum: 0
-              description: Total shipment value (for customs/export).
-            deliveryInstructions:
-              type: string
-              maxLength: 15
-              description: Optional short instructions.
-            insuranceValue:
-              type: number
-              minimum: 0
-              description: Optional.
-            signatureRequired:
-              $ref: "#/components/schemas/SignatureRequired"
-            registration:
-              $ref: "#/components/schemas/RegistrationInfo"
-          required: [incoterm, exportReason, originCountry, description, totalValue, signatureRequired]
-        invoice:
-          $ref: "#/components/schemas/InvoiceFile"
+        selectedRate: { $ref: "#/components/schemas/SelectedRate" }
+        shippingOptions: { $ref: "#/components/schemas/ShippingOptions" }
+        invoice: { $ref: "#/components/schemas/InvoiceFile" }
       required: [reference, shipper, recipient, packages, selectedRate, shippingOptions]
 
     ShipmentStatus:
@@ -460,27 +480,25 @@ components:
       type: object
       additionalProperties: false
       properties:
+        requestId: { type: string }
         shipmentId: { type: string }
         status: { $ref: "#/components/schemas/ShipmentStatus" }
-        requestId: { type: string }
         trackingNumbers:
           type: array
           items: { type: string }
         documents:
           type: array
           items: { $ref: "#/components/schemas/DocumentRef" }
-        error:
-          $ref: "#/components/schemas/ErrorResponse"
-      required: [shipmentId, status, requestId]
+      required: [requestId, shipmentId, status, documents]
 
     CancelShipmentResponse:
       type: object
       additionalProperties: false
       properties:
+        requestId: { type: string }
         shipmentId: { type: string }
         status: { $ref: "#/components/schemas/ShipmentStatus" }
-        requestId: { type: string }
-      required: [shipmentId, status, requestId]
+      required: [requestId, shipmentId, status]
 
 paths:
   /v1/rates/quote:
@@ -490,13 +508,12 @@ paths:
       summary: Get shipping options (rates)
       description: >
         Returns a list of shipping options for the given addresses and packages.
+
+        Validation:
+          - If a field is missing/invalid, you receive HTTP 422 with details that can be shown to the user.
+          - Region/state is required for US/CA/AU.
       security:
         - FrontendKeyAuth: []
-      parameters:
-        - $ref: "#/components/parameters/XRequestId"
-      x-retry-policy:
-        guidance: "If error.retryable=true, retry with backoff. In checkout flows, keep retries low (2–3)."
-        retryableErrorCodes: [TEMPORARY_CARRIER_FAILURE, UPSTREAM_TIMEOUT, RATE_LIMITED]
       requestBody:
         required: true
         content:
@@ -505,8 +522,6 @@ paths:
       responses:
         "200":
           description: OK
-          headers:
-            X-Request-Id: { $ref: "#/components/headers/XRequestId" }
           content:
             application/json:
               schema: { $ref: "#/components/schemas/QuoteResponse" }
@@ -520,6 +535,18 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ErrorResponse" }
+              examples:
+                invalidPostal:
+                  value:
+                    error:
+                      code: VALIDATION_ERROR
+                      message: "Some fields are invalid."
+                      retryable: false
+                      requestId: "req_abc123"
+                      details:
+                        - path: "recipient.postalCode"
+                          reason: "invalid_format"
+                          message: "Postal code format is not valid. Example: 1234 AB"
         "429":
           description: Too many requests
           content:
@@ -543,15 +570,13 @@ paths:
       summary: Create a shipment
       description: >
         Creates a shipment using a selected rate from a previous quote.
-        If addresses or packages changed since the quote, the request will fail.
+
+        Important:
+          - If address/package details changed since the quote, the request fails with 422 SELECTION_MISMATCH.
       security:
         - BackendKeyAuth: []
       parameters:
-        - $ref: "#/components/parameters/XRequestId"
         - $ref: "#/components/parameters/IdempotencyKey"
-      x-retry-policy:
-        guidance: "Retry only when error.retryable=true, and always reuse the same Idempotency-Key."
-        retryableErrorCodes: [TEMPORARY_CARRIER_FAILURE, UPSTREAM_TIMEOUT, RATE_LIMITED]
       requestBody:
         required: true
         content:
@@ -560,15 +585,11 @@ paths:
       responses:
         "201":
           description: Created (READY or PROCESSING)
-          headers:
-            X-Request-Id: { $ref: "#/components/headers/XRequestId" }
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ShipmentResponse" }
         "202":
           description: Accepted (PROCESSING)
-          headers:
-            X-Request-Id: { $ref: "#/components/headers/XRequestId" }
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ShipmentResponse" }
@@ -587,16 +608,16 @@ paths:
                   value:
                     error:
                       code: SELECTION_MISMATCH
-                      message: "The shipment details changed since the selected rate. Request a new quote."
+                      message: "Shipment details changed since the selected rate. Request a new quote."
                       retryable: false
-                      requestId: "req_01HZMM"
+                      requestId: "req_mm123"
                 customsRequired:
                   value:
                     error:
                       code: CUSTOMS_REQUIRED
                       message: "Customs/registration details are required for this shipment."
                       retryable: false
-                      requestId: "req_01HZCUST"
+                      requestId: "req_cust123"
         "409":
           description: Conflict
           content:
@@ -617,12 +638,13 @@ paths:
     get:
       tags: [Shipments]
       operationId: getShipment
-      summary: Get shipment status
-      description: Returns the current shipment status and any available documents.
+      summary: Get shipment details
+      description: >
+        Returns the current shipment status and any available documents.
+        This is mainly used for reprinting/retrieving labels later.
       security:
         - BackendKeyAuth: []
       parameters:
-        - $ref: "#/components/parameters/XRequestId"
         - name: shipmentId
           in: path
           required: true
@@ -630,8 +652,6 @@ paths:
       responses:
         "200":
           description: OK
-          headers:
-            X-Request-Id: { $ref: "#/components/headers/XRequestId" }
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ShipmentResponse" }
@@ -650,7 +670,6 @@ paths:
       security:
         - BackendKeyAuth: []
       parameters:
-        - $ref: "#/components/parameters/XRequestId"
         - name: shipmentId
           in: path
           required: true
@@ -658,20 +677,18 @@ paths:
       responses:
         "200":
           description: OK
-          headers:
-            X-Request-Id: { $ref: "#/components/headers/XRequestId" }
           content:
             application/json:
               schema:
                 type: object
                 additionalProperties: false
                 properties:
-                  shipmentId: { type: string }
                   requestId: { type: string }
+                  shipmentId: { type: string }
                   documents:
                     type: array
                     items: { $ref: "#/components/schemas/DocumentRef" }
-                required: [shipmentId, requestId, documents]
+                required: [requestId, shipmentId, documents]
         "404":
           description: Not found
           content:
@@ -687,7 +704,6 @@ paths:
       security:
         - BackendKeyAuth: []
       parameters:
-        - $ref: "#/components/parameters/XRequestId"
         - name: shipmentId
           in: path
           required: true
@@ -695,8 +711,6 @@ paths:
       responses:
         "200":
           description: OK
-          headers:
-            X-Request-Id: { $ref: "#/components/headers/XRequestId" }
           content:
             application/json:
               schema: { $ref: "#/components/schemas/CancelShipmentResponse" }
@@ -705,4 +719,3 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ErrorResponse" }
-
