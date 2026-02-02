@@ -1,6 +1,6 @@
 openapi: 3.1.0
 info:
-  title: Inset Shipping API
+  title: TFF Shipping API
   version: 1.0.0
   description: >
     Use this API to:
