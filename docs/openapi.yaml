@@ -2,3 +2,862 @@ openapi: 3.1.0
 info:
   title: Plugtech TFF Shipping API
   version: 1.0.0
+  description: >
+    Contract-first API that fronts a per-tenant TFF account.
+    Tenancy is resolved from X-Api-Key (per client). TFF credentials are stored per tenant
+    and used server-side when calling upstream.
+
+    Key properties:
+      - Stable, normalized errors: code + message + retryable + requestId (+ optional details/upstream debug)
+      - Safe retries for shipment creation via Idempotency-Key
+      - Quote → select rate in Woo checkout → persist chosen Rating (incl reusableData) to Woo order meta
+        → replay later from Odoo/admin to create a shipment
+      - Selection mismatch policy: HARD FAIL (422 SELECTION_MISMATCH)
+
+servers:
+  - url: https://api.plugtech.example
+    description: Production (replace)
+  - url: https://sandbox.api.plugtech.example
+    description: Sandbox (replace)
+
+security:
+  - ApiKeyAuth: []
+
+tags:
+  - name: Rates
+  - name: Shipments
+  - name: Documents
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-Api-Key
+
+  parameters:
+    XRequestId:
+      name: X-Request-Id
+      in: header
+      required: false
+      description: Optional correlation id; echoed back and included in error.requestId.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 128
+
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: >
+        REQUIRED for createShipment. Use a stable key per business action.
+        Retries MUST reuse the same key to prevent duplicate shipments.
+        Example: "odoo:picking:WH/OUT/00123" or "wc:1000123:shipment".
+      schema:
+        type: string
+        minLength: 8
+        maxLength: 200
+
+  headers:
+    XRequestId:
+      description: Correlation id for support/debugging.
+      schema:
+        type: string
+
+  schemas:
+    # -----------------------------
+    # Error model (stable contract)
+    # -----------------------------
+    ErrorCode:
+      type: string
+      enum:
+        - VALIDATION_ERROR
+        - INVALID_ADDRESS
+        - CUSTOMS_REQUIRED
+        - NO_SERVICES_AVAILABLE
+        - TEMPORARY_CARRIER_FAILURE
+        - UPSTREAM_TIMEOUT
+        - AUTH_FAILED
+        - RATE_LIMITED
+        - CONFLICT
+        - UPSTREAM_ERROR
+        - INTERNAL_ERROR
+        - SELECTION_EXPIRED
+        - SELECTION_MISMATCH
+
+    ErrorDetail:
+      type: object
+      additionalProperties: false
+      properties:
+        path:
+          type: string
+          description: Pointer to invalid field (e.g. "recipientAddress.postalCode", "packages[0].weight").
+        reason:
+          type: string
+          description: Machine-readable reason (required/invalid_format/out_of_range/etc.).
+        message:
+          type: string
+          description: Optional human-readable detail.
+      required: [path, reason]
+
+    UpstreamDebug:
+      type: object
+      additionalProperties: false
+      description: >
+        Optional upstream debug info. Clients MUST NOT parse this as business contract.
+      properties:
+        provider: { type: string, example: TFF }
+        httpStatus: { type: integer, minimum: 100, maximum: 599 }
+        contentType: { type: string, example: "text/html" }
+        code:
+          type: [string, "null"]
+          description: Upstream provider error code (if any).
+        snippet:
+          type: [string, "null"]
+          maxLength: 300
+          description: Sanitized snippet (never raw HTML).
+      required: [provider, httpStatus, contentType]
+
+    ErrorResponse:
+      type: object
+      additionalProperties: false
+      properties:
+        error:
+          type: object
+          additionalProperties: false
+          properties:
+            code: { $ref: "#/components/schemas/ErrorCode" }
+            message:
+              type: string
+              description: Human-readable message safe for UI.
+            retryable:
+              type: boolean
+              description: Whether the client may retry this request (with backoff).
+            requestId:
+              type: string
+              description: Correlation id to provide to support.
+            details:
+              type: array
+              items: { $ref: "#/components/schemas/ErrorDetail" }
+            upstream:
+              $ref: "#/components/schemas/UpstreamDebug"
+          required: [code, message, retryable, requestId]
+      required: [error]
+
+    # -----------------------------
+    # Core domain types (aligned to your TS)
+    # -----------------------------
+    Address:
+      type: object
+      additionalProperties: false
+      properties:
+        company:
+          type: string
+          maxLength: 35
+        firstName:
+          type: string
+          maxLength: 35
+        lastName:
+          type: string
+          maxLength: 35
+        email:
+          type: string
+          description: May be empty string; validated if present.
+        street:
+          type: array
+          minItems: 2
+          maxItems: 2
+          items:
+            type: string
+            maxLength: 35
+          description: [street line 1, street line 2]. Line 2 may be empty.
+        city:
+          type: string
+          maxLength: 35
+        region:
+          type: string
+          maxLength: 35
+        postalCode:
+          type: string
+          maxLength: 16
+        country:
+          type: string
+          minLength: 2
+          maxLength: 2
+          description: ISO 3166-1 alpha-2
+        phoneNumber:
+          type: string
+          maxLength: 32
+      required:
+        - company
+        - firstName
+        - lastName
+        - email
+        - street
+        - city
+        - region
+        - postalCode
+        - country
+        - phoneNumber
+
+    TruckShipmentInformation:
+      type: object
+      additionalProperties: false
+      properties:
+        shipperVehicle: { type: string, enum: [car, "box truck", lorry] }
+        shipperForklift: { type: boolean }
+        shipperTaillift: { type: boolean }
+        recipientVehicle: { type: string, enum: [car, "box truck", lorry] }
+        recipientForklift: { type: boolean }
+        recipientTaillift: { type: boolean }
+
+    CarrierAccountNumber:
+      type: object
+      additionalProperties: false
+      properties:
+        specifyCarrierAccountNumber: { type: boolean }
+        carrierAccountNumber: { type: string }
+        carrierAccountNumberCountry: { type: string, minLength: 2, maxLength: 2 }
+        carrierAccountNumberPostalCode: { type: string }
+      required:
+        - specifyCarrierAccountNumber
+        - carrierAccountNumber
+        - carrierAccountNumberCountry
+        - carrierAccountNumberPostalCode
+
+    PackageTemplate:
+      type: object
+      additionalProperties: false
+      properties:
+        templateId: { type: string }
+        userId: { type: string }
+        name: { type: string }
+        length: { type: number, minimum: 0 }
+        width: { type: number, minimum: 0 }
+        height: { type: number, minimum: 0 }
+        weight: { type: number, minimum: 0 }
+        type: { type: string, enum: [package, pallet, document] }
+        carrier: { type: string }
+        originCountry: { type: string, minLength: 2, maxLength: 2 }
+        hsCode: { type: string }
+        stackable: { type: boolean }
+        dangerousGoods: { type: boolean }
+        vehicle: { type: string, enum: [car, "box truck", lorry] }
+        bioGoods: { type: boolean }
+      required:
+        - templateId
+        - userId
+        - name
+        - length
+        - width
+        - height
+        - weight
+        - type
+        - dangerousGoods
+        - bioGoods
+
+    AccessPoint:
+      type: object
+      additionalProperties: false
+      properties:
+        id: { type: string }
+        name: { type: string }
+        address: { type: string }
+        city: { type: string }
+        postalCode: { type: string }
+        country: { type: string, minLength: 2, maxLength: 2 }
+        chosen: { type: boolean }
+      required: [id, name, address, city, postalCode, country, chosen]
+
+    PickupDate:
+      type: object
+      additionalProperties: false
+      properties:
+        date: { type: string, format: date }
+        transitTime: { type: string }
+
+    Rating:
+      type: object
+      additionalProperties: false
+      description: >
+        Returned by rates endpoint. You get back an ARRAY of these.
+        Persist the chosen Rating (including reusableData) in Woo order meta.
+        Later, Odoo/admin replays chosenRate to createShipment.
+
+        "Stability rate identifiers: yes" -> quoteId + rateId + serviceId are supported and SHOULD be present.
+      properties:
+        # Stable identifiers (recommended; keep even if you also show friendly names)
+        quoteId:
+          type: string
+          description: Quote identifier from /v1/rates/quote.
+        rateId:
+          type: string
+          description: Stable id for this rate within a quote.
+        serviceId:
+          type: string
+          description: Stable service identifier (contract id).
+
+        carrier: { type: string }
+        service: { type: string }
+        serviceDescription: { type: string }
+        price:
+          type: string
+          description: Decimal string (e.g. "12.34").
+        imgUrl: { type: string }
+        transitTime: { type: string }
+        pickupDate: { type: string, format: date }
+        pickupTime: { type: string }
+        deliveryDate: { type: string, format: date }
+        deliveryTime: { type: string }
+        carbonNeutral: { type: boolean }
+        availablePickupDates:
+          type: array
+          items: { $ref: "#/components/schemas/PickupDate" }
+        noPickupPossible: { type: boolean }
+        accessPoints:
+          type: array
+          items: { $ref: "#/components/schemas/AccessPoint" }
+
+        reusableData:
+          type: object
+          description: Opaque blob used later for shipment creation. Store and replay verbatim.
+      required:
+        - carrier
+        - service
+        - price
+        - reusableData
+
+    ShipmentOptions:
+      type: object
+      additionalProperties: false
+      properties:
+        invoiceRef: { type: string }
+        chosenRate: { $ref: "#/components/schemas/Rating" }
+
+        incotermsGroupD: { type: string, enum: [DAP, DPU, DDP] }
+        description: { type: string, maxLength: 35 }
+        exportReason:
+          type: string
+          enum: [sale, retour, "retour after repair", personal, sample, gift]
+        shipmentOriginCountry: { type: string, minLength: 2, maxLength: 2 }
+        totalShipmentValue: { type: number, minimum: 0 }
+
+        registrationNumberTypeShipper: { type: string }
+        registrationNumberShipper: { type: string }
+        registrationNumberTypeRecipient: { type: string }
+        registrationNumberRecipient: { type: string }
+
+        deliveryInstructions: { type: string, maxLength: 200 }
+
+        truckShipmentInfo: { $ref: "#/components/schemas/TruckShipmentInformation" }
+
+        insuranceValue: { type: number, minimum: 0 }
+        signatureRequired: { type: string, enum: [direct, no_preference, adult, none] }
+
+        carrierAccountNumber: { $ref: "#/components/schemas/CarrierAccountNumber" }
+      required:
+        - chosenRate
+        - incotermsGroupD
+        - exportReason
+        - shipmentOriginCountry
+        - totalShipmentValue
+        - signatureRequired
+
+    InvoiceFile:
+      type: object
+      additionalProperties: false
+      properties:
+        filename: { type: string }
+        base64: { type: string }
+      required: []
+
+    ShipmentTemplate:
+      type: object
+      additionalProperties: false
+      properties:
+        orderId: { type: string }
+        carrier: { type: string }
+        source:
+          type: string
+          description: e.g. "woocommerce" or "odoo"
+        packages:
+          type: array
+          minItems: 1
+          items: { $ref: "#/components/schemas/PackageTemplate" }
+        shipperAddress: { $ref: "#/components/schemas/Address" }
+        recipientAddress: { $ref: "#/components/schemas/Address" }
+        shipmentOptions: { $ref: "#/components/schemas/ShipmentOptions" }
+        invoice: { $ref: "#/components/schemas/InvoiceFile" }
+      required:
+        - orderId
+        - source
+        - packages
+        - shipperAddress
+        - recipientAddress
+        - shipmentOptions
+
+    # -----------------------------
+    # Rates endpoint models
+    # -----------------------------
+    RatesContext:
+      type: string
+      enum: [checkout, backend]
+      description: >
+        checkout: UX-friendly behavior (may return 200 with empty array + warnings)
+        backend: strict behavior (prefer errors)
+
+    QuoteRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        context: { $ref: "#/components/schemas/RatesContext" }
+        shipment: { $ref: "#/components/schemas/ShipmentTemplate" }
+      required: [context, shipment]
+
+    QuoteWarning:
+      type: object
+      additionalProperties: false
+      properties:
+        code:
+          type: string
+          enum: [PARTIAL_RESULTS, CHECKOUT_FALLBACK]
+        message: { type: string }
+      required: [code, message]
+
+    # You said "we get back an array of these" (Rating[]).
+    # We still return quoteId metadata at the top-level, because you want stable identifiers.
+    QuoteResponse:
+      type: object
+      additionalProperties: false
+      properties:
+        quoteId: { type: string }
+        expiresAt: { type: string, format: date-time }
+        ratesHash:
+          type: string
+          description: Optional request hash to support caching/dedup.
+        rates:
+          type: array
+          items: { $ref: "#/components/schemas/Rating" }
+        warnings:
+          type: array
+          items: { $ref: "#/components/schemas/QuoteWarning" }
+      required: [quoteId, expiresAt, rates]
+
+    # -----------------------------
+    # Shipment creation + status
+    # -----------------------------
+    ShipmentStatus:
+      type: string
+      enum: [READY, PROCESSING, FAILED, CANCELED]
+
+    DocumentType:
+      type: string
+      enum: [LABEL, COMMERCIAL_INVOICE, CN23, OTHER]
+
+    DocumentFormat:
+      type: string
+      enum: [PDF, PNG]
+
+    DocumentRef:
+      type: object
+      additionalProperties: false
+      properties:
+        id: { type: string }
+        type: { $ref: "#/components/schemas/DocumentType" }
+        format: { $ref: "#/components/schemas/DocumentFormat" }
+        url:
+          type: string
+          format: uri
+          description: Time-limited URL (recommended).
+        expiresAt: { type: string, format: date-time }
+      required: [id, type, format, url]
+
+    CreateShipmentRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        shipment: { $ref: "#/components/schemas/ShipmentTemplate" }
+        externalRef:
+          type: string
+          description: Optional stable ref (e.g. Odoo SO/picking ref or Woo order number).
+      required: [shipment]
+      description: >
+        Requires shipment.shipmentOptions.chosenRate (including reusableData) from a prior quote selection.
+        Selection mismatch policy is HARD FAIL (422 SELECTION_MISMATCH).
+
+    ShipmentResult:
+      type: object
+      additionalProperties: false
+      properties:
+        shipmentId: { type: string }
+        status: { $ref: "#/components/schemas/ShipmentStatus" }
+        requestId: { type: string }
+        documents:
+          type: array
+          items: { $ref: "#/components/schemas/DocumentRef" }
+        trackingNumbers:
+          type: array
+          items: { type: string }
+        error:
+          $ref: "#/components/schemas/ErrorResponse"
+      required: [shipmentId, status, requestId]
+
+    CancelShipmentResponse:
+      type: object
+      additionalProperties: false
+      properties:
+        shipmentId: { type: string }
+        status: { $ref: "#/components/schemas/ShipmentStatus" }
+        requestId: { type: string }
+      required: [shipmentId, status, requestId]
+
+paths:
+  /v1/rates/quote:
+    post:
+      tags: [Rates]
+      operationId: quoteRates
+      summary: Get rates (TFF getRates front)
+      description: >
+        Quotes shipping rates based on shipment addresses + packages + options.
+        Server target: complete in 3–5 seconds.
+        This endpoint is intended to be callable from checkout contexts, but still requires X-Api-Key
+        to resolve tenant credentials server-side.
+      parameters:
+        - $ref: "#/components/parameters/XRequestId"
+      x-retry-policy:
+        idempotent: true
+        retryCondition: "Retry ONLY when error.retryable=true"
+        recommendedBackoff: "Exponential backoff with jitter; checkout max 2–3 retries"
+        retryableErrorCodes:
+          - TEMPORARY_CARRIER_FAILURE
+          - UPSTREAM_TIMEOUT
+          - RATE_LIMITED
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/QuoteRequest" }
+            examples:
+              checkoutExample:
+                value:
+                  context: checkout
+                  shipment:
+                    orderId: "WC-1000123"
+                    source: "woocommerce"
+                    packages:
+                      - templateId: "pkg-1"
+                        userId: "tenant-1"
+                        name: "Box S"
+                        type: package
+                        length: 30
+                        width: 20
+                        height: 10
+                        weight: 2
+                        stackable: true
+                        dangerousGoods: false
+                        bioGoods: false
+                        vehicle: car
+                    shipperAddress:
+                      company: "Heusinkveld"
+                      firstName: "Warehouse"
+                      lastName: "NL"
+                      email: "ops@example.com"
+                      street: ["Straat 1", ""]
+                      city: "Eindhoven"
+                      region: ""
+                      postalCode: "5611AA"
+                      country: "NL"
+                      phoneNumber: "+31600000000"
+                    recipientAddress:
+                      company: ""
+                      firstName: "Jan"
+                      lastName: "Jansen"
+                      email: "jan@example.com"
+                      street: ["Main St 12", ""]
+                      city: "Berlin"
+                      region: ""
+                      postalCode: "10115"
+                      country: "DE"
+                      phoneNumber: "+491700000000"
+                    shipmentOptions:
+                      invoiceRef: "WC-1000123"
+                      chosenRate:
+                        carrier: ""
+                        service: ""
+                        price: ""
+                        reusableData: {}
+                      incotermsGroupD: "DAP"
+                      description: "Order shipment"
+                      exportReason: "sale"
+                      shipmentOriginCountry: "NL"
+                      totalShipmentValue: 199.99
+                      registrationNumberTypeShipper: "EOR"
+                      registrationNumberShipper: ""
+                      registrationNumberTypeRecipient: "EIN"
+                      registrationNumberRecipient: ""
+                      deliveryInstructions: ""
+                      truckShipmentInfo:
+                        shipperForklift: false
+                        shipperTaillift: false
+                        recipientForklift: false
+                        recipientTaillift: false
+                      insuranceValue: 0
+                      signatureRequired: "none"
+                      carrierAccountNumber:
+                        specifyCarrierAccountNumber: false
+                        carrierAccountNumber: ""
+                        carrierAccountNumberCountry: ""
+                        carrierAccountNumberPostalCode: ""
+      responses:
+        "200":
+          description: OK
+          headers:
+            X-Request-Id: { $ref: "#/components/headers/XRequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/QuoteResponse" }
+              examples:
+                ok:
+                  value:
+                    quoteId: "q_01HZXXXX"
+                    expiresAt: "2026-02-02T12:00:00Z"
+                    ratesHash: "b7d3c2..."
+                    rates:
+                      - quoteId: "q_01HZXXXX"
+                        rateId: "r_1"
+                        serviceId: "tff:dhl:parcel-connect"
+                        carrier: "DHL"
+                        service: "Parcel Connect"
+                        serviceDescription: "DHL Parcel Connect (EU)"
+                        price: "9.95"
+                        imgUrl: "https://cdn.example/dhl.png"
+                        transitTime: "2-3d"
+                        reusableData:
+                          provider: "TFF"
+                          opaque: "..."
+                      - quoteId: "q_01HZXXXX"
+                        rateId: "r_2"
+                        serviceId: "tff:ups:standard"
+                        carrier: "UPS"
+                        service: "Standard"
+                        serviceDescription: "UPS Standard"
+                        price: "12.40"
+                        transitTime: "2-4d"
+                        reusableData:
+                          provider: "TFF"
+                          opaque: "..."
+                    warnings: []
+                checkoutFallbackEmpty:
+                  value:
+                    quoteId: "q_01HZYYYY"
+                    expiresAt: "2026-02-02T12:00:00Z"
+                    ratesHash: "c91aa1..."
+                    rates: []
+                    warnings:
+                      - code: "CHECKOUT_FALLBACK"
+                        message: "Tarieven tijdelijk niet beschikbaar. Probeer het zo nog eens."
+        "401":
+          description: Authentication failed (unknown/disabled X-Api-Key)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+              examples:
+                auth:
+                  value:
+                    error:
+                      code: AUTH_FAILED
+                      message: "Invalid API key."
+                      retryable: false
+                      requestId: "req_01HZAUTH"
+        "422":
+          description: Validation error (bad input)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "429":
+          description: Rate limited (retryable with backoff)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "503":
+          description: Temporary upstream/carrier failure (retryable)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "504":
+          description: Upstream timeout (retryable)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "500":
+          description: Internal error
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
+  /v1/shipments:
+    post:
+      tags: [Shipments]
+      operationId: createShipment
+      summary: Create shipment from chosen rate
+      description: >
+        Creates a shipment using shipment.shipmentOptions.chosenRate (including reusableData) from a prior quote.
+        Idempotency-Key is REQUIRED to make retries safe.
+        The API may respond with status=PROCESSING; poll GET /v1/shipments/{shipmentId}.
+      parameters:
+        - $ref: "#/components/parameters/XRequestId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      x-retry-policy:
+        idempotent: "Yes, if Idempotency-Key is reused"
+        retryCondition: "Retry ONLY when error.retryable=true AND reuse the same Idempotency-Key"
+        recommendedBackoff: "Exponential backoff with jitter; backend max 3–5 retries"
+        retryableErrorCodes:
+          - TEMPORARY_CARRIER_FAILURE
+          - UPSTREAM_TIMEOUT
+          - RATE_LIMITED
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateShipmentRequest" }
+      responses:
+        "201":
+          description: Created (READY or PROCESSING)
+          headers:
+            X-Request-Id: { $ref: "#/components/headers/XRequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ShipmentResult" }
+        "202":
+          description: Accepted (PROCESSING)
+          headers:
+            X-Request-Id: { $ref: "#/components/headers/XRequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ShipmentResult" }
+        "409":
+          description: Conflict
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "422":
+          description: Selection mismatch/expired/customs required/validation
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+              examples:
+                mismatch:
+                  value:
+                    error:
+                      code: SELECTION_MISMATCH
+                      message: "Shipment data changed since checkout selection; re-quote required."
+                      retryable: false
+                      requestId: "req_01HZMM"
+        "503":
+          description: Temporary failure (retryable with Idempotency-Key)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
+  /v1/shipments/{shipmentId}:
+    get:
+      tags: [Shipments]
+      operationId: getShipment
+      summary: Get shipment status (polling)
+      parameters:
+        - $ref: "#/components/parameters/XRequestId"
+        - name: shipmentId
+          in: path
+          required: true
+          schema: { type: string }
+      x-retry-policy:
+        idempotent: true
+        retryCondition: "Safe to retry on transient errors"
+        retryableErrorCodes:
+          - UPSTREAM_TIMEOUT
+          - RATE_LIMITED
+      responses:
+        "200":
+          description: OK
+          headers:
+            X-Request-Id: { $ref: "#/components/headers/XRequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ShipmentResult" }
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
+  /v1/shipments/{shipmentId}/documents:
+    get:
+      tags: [Documents]
+      operationId: listShipmentDocuments
+      summary: List shipment documents (labels/invoices)
+      parameters:
+        - $ref: "#/components/parameters/XRequestId"
+        - name: shipmentId
+          in: path
+          required: true
+          schema: { type: string }
+      x-retry-policy:
+        idempotent: true
+        retryableErrorCodes:
+          - UPSTREAM_TIMEOUT
+          - RATE_LIMITED
+      responses:
+        "200":
+          description: OK
+          headers:
+            X-Request-Id: { $ref: "#/components/headers/XRequestId" }
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                properties:
+                  shipmentId: { type: string }
+                  requestId: { type: string }
+                  documents:
+                    type: array
+                    items: { $ref: "#/components/schemas/DocumentRef" }
+                required: [shipmentId, requestId, documents]
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
+  /v1/shipments/{shipmentId}/cancel:
+    post:
+      tags: [Shipments]
+      operationId: cancelShipment
+      summary: Cancel shipment
+      parameters:
+        - $ref: "#/components/parameters/XRequestId"
+        - name: shipmentId
+          in: path
+          required: true
+          schema: { type: string }
+      x-retry-policy:
+        idempotent: true
+        retryableErrorCodes:
+          - UPSTREAM_TIMEOUT
+          - RATE_LIMITED
+          - TEMPORARY_CARRIER_FAILURE
+      responses:
+        "200":
+          description: Canceled (or already canceled)
+          headers:
+            X-Request-Id: { $ref: "#/components/headers/XRequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CancelShipmentResponse" }
+        "409":
+          description: Cannot cancel (already shipped, etc.)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
