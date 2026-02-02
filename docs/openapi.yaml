@@ -1,0 +1,4 @@
+openapi: 3.1.0
+info:
+  title: Plugtech TFF Shipping API
+  version: 1.0.0
