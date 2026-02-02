@@ -171,7 +171,7 @@ components:
           items:
             type: string
             maxLength: 35
-          description: [street line 1, street line 2]. Line 2 may be empty.
+          description: [street line 1, street line 2]
         city:
           type: string
           maxLength: 35
